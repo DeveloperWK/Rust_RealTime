@@ -6,10 +6,13 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, time::Duration};
+use std::{sync::Arc, vec};
 use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(90);
 #[derive(Clone)]
 pub struct AppState {
     pub clients: Arc<RwLock<HashMap<String, ClientInfo>>>,
@@ -20,6 +23,7 @@ pub struct ClientInfo {
     pub id: String,
     pub username: String,
     pub connected_at: std::time::Instant,
+    pub last_heartbeat: Arc<RwLock<std::time::Instant>>,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct BroadcastMessage {
@@ -50,15 +54,17 @@ async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+    ws.on_upgrade(|socket| handle_socket_with_heartbeat(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket_with_heartbeat(socket: WebSocket, state: AppState) {
     let client_id = Uuid::new_v4().to_string();
 
     let (mut sender, mut receiver) = socket.split();
 
     let mut broadcast_rx = state.broadcast_tx.subscribe();
+    let sender = Arc::new(tokio::sync::Mutex::new(sender));
+    let last_heartbeat = Arc::new(RwLock::new(std::time::Instant::now()));
 
     {
         let mut clients = state.clients.write().await;
@@ -68,15 +74,41 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 id: client_id.clone(),
                 username: format!("user_{}", &client_id[..8]),
                 connected_at: std::time::Instant::now(),
+                last_heartbeat: last_heartbeat.clone(),
             },
         );
     }
 
     tracing::info!("Client {} connected", client_id);
+    let heartbeat_sender = sender.clone();
+    let heartbeat_time = last_heartbeat.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            interval.tick().await;
+            let last = *heartbeat_time.read().await;
+            if last.elapsed() > CLIENT_TIMEOUT {
+                tracing::warn!("Client timed out");
+                break;
+            }
+            let mut sender = heartbeat_sender.lock().await;
+            if sender.send(Message::Ping(vec![1, 2, 3])).await.is_err() {
+                break;
+            }
+        }
+    });
+    let broadcast_sender = sender.clone();
 
     let send_task = tokio::spawn(async move {
         while let Ok(msg) = broadcast_rx.recv().await {
-            let json = serde_json::to_string(&msg).unwrap();
+            let json = match serde_json::to_string(&msg) {
+                Ok(json) => json,
+                Err(err) => {
+                    tracing::error!("Failed to serialize broadcast: {}", err);
+                    continue;
+                }
+            };
+            let mut sender = broadcast_sender.lock().await;
             if sender.send(Message::Text(json)).await.is_err() {
                 break;
             }
@@ -87,21 +119,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let broadcast_tx = state.broadcast_tx.clone();
 
     while let Some(Ok(msg)) = receiver.next().await {
-        if let Message::Text(text) = msg {
-            let broadcast_msg = BroadcastMessage {
-                sender_id: client_id_clone.clone(),
-                username: format!("user_{}", &client_id_clone[..8]),
-                content: text,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            };
-            let _ = broadcast_tx.send(broadcast_msg);
+        *last_heartbeat.write().await = std::time::Instant::now();
+        match msg {
+            Message::Pong(_) => {
+                tracing::debug!("Received pong from {}", client_id_clone);
+            }
+
+            Message::Text(text) => {
+                let broadcast_msg = BroadcastMessage {
+                    sender_id: client_id_clone.clone(),
+                    username: format!("user_{}", &client_id_clone[..8]),
+                    content: text,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                };
+
+                let _ = broadcast_tx.send(broadcast_msg);
+            }
+
+            Message::Close(_) => {
+                break;
+            }
+
+            _ => {}
         }
     }
-
+    heartbeat_task.abort();
     send_task.abort();
+
     state.clients.write().await.remove(&client_id);
+
     tracing::info!("Client {} disconnected", client_id);
 }
