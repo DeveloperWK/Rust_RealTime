@@ -6,7 +6,10 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use std::{sync::Arc, vec};
 use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
@@ -16,22 +19,50 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(90);
 #[derive(Clone)]
 pub struct AppState {
     pub clients: Arc<RwLock<HashMap<String, ClientInfo>>>,
-    pub broadcast_tx: broadcast::Sender<BroadcastMessage>,
+    pub broadcast_tx: broadcast::Sender<ServerEvent>,
 }
 
 pub struct ClientInfo {
     pub id: String,
     pub username: String,
     pub connected_at: std::time::Instant,
-    pub last_heartbeat: Arc<RwLock<std::time::Instant>>,
+    pub last_pong: Arc<RwLock<std::time::Instant>>,
 }
+
+// Client -> Server
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum ClientEvent {
+    #[serde(rename = "message")]
+    Message { content: String },
+    #[serde(rename = "typing")]
+    Typing,
+    #[serde(rename = "read")]
+    Read { message_id: String },
+}
+// Server -> Client Event
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct BroadcastMessage {
-    pub sender_id: String,
-    pub username: String,
-    pub content: String,
-    pub timestamp: u64,
+#[serde(tag = "type")]
+pub enum ServerEvent {
+    #[serde(rename = "message_created")]
+    MessageCreated {
+        message_id: String,
+        sender_id: String,
+        username: String,
+        content: String,
+        timestamp: u64,
+    },
+    #[serde(rename = "user_typing")]
+    UserTyping {
+        user_id: String,
+        username: String,
+    },
+    MessageRead {
+        message_id: String,
+        user_id: String,
+    },
 }
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -54,34 +85,35 @@ async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket_with_heartbeat(socket, state))
+    ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-async fn handle_socket_with_heartbeat(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState) {
     let client_id = Uuid::new_v4().to_string();
+    let username = format!("user_{}", &client_id[..8]);
 
-    let (mut sender, mut receiver) = socket.split();
-
+    let (sender, mut receiver) = socket.split();
     let mut broadcast_rx = state.broadcast_tx.subscribe();
-    let sender = Arc::new(tokio::sync::Mutex::new(sender));
-    let last_heartbeat = Arc::new(RwLock::new(std::time::Instant::now()));
-
+    // let sender = Arc::new(tokio::sync::Mutex::new(sender));
+    // let last_heartbeat = Arc::new(RwLock::new(std::time::Instant::now()));
+    let last_pong = Arc::new(RwLock::new(Instant::now()));
     {
         let mut clients = state.clients.write().await;
         clients.insert(
             client_id.clone(),
             ClientInfo {
                 id: client_id.clone(),
-                username: format!("user_{}", &client_id[..8]),
-                connected_at: std::time::Instant::now(),
-                last_heartbeat: last_heartbeat.clone(),
+                username: username.clone(),
+                connected_at: Instant::now(),
+                last_pong: last_pong.clone(),
             },
         );
     }
 
-    tracing::info!("Client {} connected", client_id);
-    let heartbeat_sender = sender.clone();
-    let heartbeat_time = last_heartbeat.clone();
+    tracing::info!("Client connected: {} ({})", username, client_id);
+    let heartbeat_sender = Arc::new(tokio::sync::Mutex::new(sender));
+    let heartbeat_sender_clone = heartbeat_sender.clone();
+    let heartbeat_time = last_pong.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
@@ -91,17 +123,17 @@ async fn handle_socket_with_heartbeat(socket: WebSocket, state: AppState) {
                 tracing::warn!("Client timed out");
                 break;
             }
-            let mut sender = heartbeat_sender.lock().await;
+            let mut sender = heartbeat_sender_clone.lock().await;
             if sender.send(Message::Ping(vec![1, 2, 3])).await.is_err() {
                 break;
             }
         }
     });
-    let broadcast_sender = sender.clone();
+    let broadcast_sender = heartbeat_sender.clone();
 
     let send_task = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
-            let json = match serde_json::to_string(&msg) {
+        while let Ok(event) = broadcast_rx.recv().await {
+            let json = match serde_json::to_string(&event) {
                 Ok(json) => json,
                 Err(err) => {
                     tracing::error!("Failed to serialize broadcast: {}", err);
@@ -115,31 +147,43 @@ async fn handle_socket_with_heartbeat(socket: WebSocket, state: AppState) {
         }
     });
 
-    let client_id_clone = client_id.clone();
-    let broadcast_tx = state.broadcast_tx.clone();
+    while let Some(result) = receiver.next().await {
+        let message = match result {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!("WebSocket receive error: {}", error);
+                break;
+            }
+        };
 
-    while let Some(Ok(msg)) = receiver.next().await {
-        *last_heartbeat.write().await = std::time::Instant::now();
-        match msg {
+        match message {
             Message::Pong(_) => {
-                tracing::debug!("Received pong from {}", client_id_clone);
+                *last_pong.write().await = Instant::now();
+                tracing::debug!("Received pong from {}", username);
             }
 
             Message::Text(text) => {
-                let broadcast_msg = BroadcastMessage {
-                    sender_id: client_id_clone.clone(),
-                    username: format!("user_{}", &client_id_clone[..8]),
-                    content: text,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                };
+                tracing::info!("RAW MESSAGE RECEIVED: {:?}", text);
+                let event: ClientEvent = match serde_json::from_str(&text) {
+                    Ok(event) => event,
 
-                let _ = broadcast_tx.send(broadcast_msg);
+                    // Err(error) => {
+                    //     tracing::warn!("Invalid client event: {}", error);
+
+                    //     continue;
+                    // }
+                    Err(error) => {
+                        tracing::warn!("Invalid client event: {} | Received: {:?}", error, text);
+
+                        continue;
+                    }
+                };
+                handle_client_event(event, &client_id, &username, &state).await;
             }
 
             Message::Close(_) => {
+                tracing::info!("Client requested disconnect: {}", username);
+
                 break;
             }
 
@@ -151,5 +195,56 @@ async fn handle_socket_with_heartbeat(socket: WebSocket, state: AppState) {
 
     state.clients.write().await.remove(&client_id);
 
-    tracing::info!("Client {} disconnected", client_id);
+    tracing::info!("Client disconnected: {}", username);
+}
+async fn handle_client_event(
+    event: ClientEvent,
+    client_id: &str,
+    username: &str,
+    state: &AppState,
+) {
+    match event {
+        ClientEvent::Message { content } => {
+            let message_id = Uuid::new_v4().to_string();
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let event = ServerEvent::MessageCreated {
+                message_id,
+                sender_id: client_id.to_string(),
+                username: username.to_string(),
+                content,
+                timestamp,
+            };
+
+            match state.broadcast_tx.send(event) {
+                Ok(receiver_count) => {
+                    tracing::info!(
+                        "Message broadcast successfully to {} clients",
+                        receiver_count
+                    );
+                }
+
+                Err(error) => {
+                    tracing::warn!("Failed to broadcast message: {}", error);
+                }
+            }
+        }
+        ClientEvent::Typing => {
+            let event = ServerEvent::UserTyping {
+                user_id: client_id.to_string(),
+                username: username.to_string(),
+            };
+
+            let _ = state.broadcast_tx.send(event);
+        }
+        ClientEvent::Read { message_id } => {
+            let event = ServerEvent::MessageRead {
+                message_id,
+                user_id: client_id.to_string(),
+            };
+            let _ = state.broadcast_tx.send(event);
+        }
+    }
 }
